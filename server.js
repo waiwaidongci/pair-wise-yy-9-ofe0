@@ -3,6 +3,19 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { loadRackDb, saveRackDb, withLock, newSessionId } from "./lib/rackStore.js";
+import {
+  SessionStatus,
+  RuleError,
+  createSession,
+  patchSessionParams,
+  moveSessionRack,
+  recheckSession,
+  closeSession,
+  rackOverview,
+  assertNegativeCodeUnique
+} from "./lib/rackRules.js";
+import { rackPage } from "./lib/rackPage.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const dbPath = join(__dirname, "data", "cyanotype-negative-room.json");
@@ -90,7 +103,7 @@ function page() {
   </style>
 </head>
 <body>
-  <header><div><h1>古法蓝晒底片整理室</h1><div class="meta">底片任务、工艺步骤、缺陷和入盒交付</div></div><button id="reload">刷新</button></header>
+  <header><div><h1>古法蓝晒底片整理室</h1><div class="meta">底片任务、工艺步骤、缺陷和入盒交付 · <a href="/racks" style="color:var(--accent)">晒架占用与曝光补偿 →</a></div></div><button id="reload">刷新</button></header>
   <main>
     <section>
       <form id="createForm"><h2>新增底片</h2><div id="fields"></div><label>初始状态</label><select name="status">${stages.map(s => '<option>'+s+'</option>').join('')}</select><button>保存底片</button></form>
@@ -154,11 +167,15 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const db = await loadDb();
     if (req.method === "GET" && url.pathname === "/") return html(res, page());
+    if (req.method === "GET" && url.pathname === "/racks") return html(res, rackPage());
     if (req.method === "GET" && url.pathname === "/api/items") return send(res, 200, db.items.map(summarize));
     if (req.method === "POST" && url.pathname === "/api/items") {
       const input = await body(req);
+      // 每张底片按编号唯一
+      try { assertNegativeCodeUnique(db.items, String(input.code || "").trim()); }
+      catch (e) { if (e instanceof RuleError) return send(res, e.status, { error: e.code, message: e.message }); throw e; }
       const item = { id: newId(), ...input, logs: [{ at: new Date().toISOString(), step: "建档", note: "创建底片" }] };
-      
+
       db.items.unshift(item);
       await saveDb(db);
       return send(res, 201, item);
@@ -201,9 +218,86 @@ const server = http.createServer(async (req, res) => {
       return send(res, 201, item);
     }
     if (req.method === "GET" && url.pathname === "/api/stats") return send(res, 200, computeStats(db.items));
+
+    // —— 蓝晒晒架占用与曝光补偿模块 ——
+    if (req.method === "GET" && url.pathname === "/api/rack-room") {
+      const rdb = await loadRackDb();
+      return send(res, 200, rackOverview(rdb, db.items));
+    }
+    if (req.method === "POST" && url.pathname === "/api/sessions") {
+      const input = await body(req);
+      return withLock(async () => {
+        const [rdb, freshDb] = await Promise.all([loadRackDb(), loadDb()]);
+        const session = createSession(rdb, freshDb.items, input);
+        session.id = newSessionId();
+        rdb.sessions.push(session);
+        await saveRackDb(rdb);
+        const status = session.status === SessionStatus.RECHECK ? 201 : 201;
+        return send(res, status, session);
+      }).catch(handleRuleError(res));
+    }
+    const sessionPatch = url.pathname.match(/^\/api\/sessions\/([^/]+)$/);
+    if (sessionPatch && req.method === "PATCH") {
+      const patch = await body(req);
+      return withLock(async () => {
+        const [rdb, freshDb] = await Promise.all([loadRackDb(), loadDb()]);
+        const session = patchSessionParams(rdb, freshDb.items, sessionPatch[1], patch);
+        await saveRackDb(rdb);
+        return send(res, 200, session);
+      }).catch(handleRuleError(res));
+    }    const moveRack = url.pathname.match(/^\/api\/sessions\/([^/]+)\/rack$/);
+    if (moveRack && req.method === "POST") {
+      const input = await body(req);
+      return withLock(async () => {
+        const rdb = await loadRackDb();
+        const session = moveSessionRack(rdb, moveRack[1], input.rackId);
+        await saveRackDb(rdb);
+        return send(res, 200, session);
+      }).catch(handleRuleError(res));
+    }
+    const recheck = url.pathname.match(/^\/api\/sessions\/([^/]+)\/recheck$/);
+    if (recheck && req.method === "POST") {
+      return withLock(async () => {
+        const [rdb, freshDb] = await Promise.all([loadRackDb(), loadDb()]);
+        const session = recheckSession(rdb, freshDb.items, recheck[1]);
+        await saveRackDb(rdb);
+        return send(res, 200, session);
+      }).catch(handleRuleError(res));
+    }
+    const closeS = url.pathname.match(/^\/api\/sessions\/([^/]+)\/close$/);
+    if (closeS && req.method === "POST") {
+      return withLock(async () => {
+        const rdb = await loadRackDb();
+        const session = closeSession(rdb, closeS[1]);
+        await saveRackDb(rdb);
+        return send(res, 200, session);
+      }).catch(handleRuleError(res));
+    }
+    const batchPatch = url.pathname.match(/^\/api\/chemical-batches\/([^/]+)$/);
+    if (batchPatch && req.method === "PATCH") {
+      const input = await body(req);
+      return withLock(async () => {
+        const rdb = await loadRackDb();
+        const batch = rdb.chemicalBatches.find(b => b.code === batchPatch[1]);
+        if (!batch) return send(res, 404, { error: "batch_not_found" });
+        if (typeof input.active === "boolean") batch.active = input.active;
+        if (typeof input.note === "string") batch.note = input.note;
+        await saveRackDb(rdb);
+        return send(res, 200, batch);
+      }).catch(handleRuleError(res));
+    }
+
     send(res, 404, { error: "not_found" });
   } catch (error) {
     send(res, 500, { error: error.message });
   }
 });
+
+// 规则层冲突（如晒架被占 409）原样转成 HTTP 响应；withLock 链内抛出才不会被吞。
+function handleRuleError(res) {
+  return error => {
+    if (error instanceof RuleError) return send(res, error.status, { error: error.code, message: error.message });
+    return send(res, 500, { error: error.message });
+  };
+}
 server.listen(port, () => console.log("古法蓝晒底片整理室 listening on http://localhost:" + port));
